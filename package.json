@@ -1,0 +1,21 @@
+{
+  "name": "fpt-signing-server",
+  "version": "1.0.0",
+  "description": "Headless FPT CA USB Signing Service & CLI for Linux (Arch Linux)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test-sign": "node cli-sign.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "graphene-pk11": "^2.1.13",
+    "moment": "^2.30.1",
+    "multer": "^1.4.2",
+    "node-forge": "^0.10.0",
+    "request-ip": "^2.1.3",
+    "xml-crypto": "^1.5.3",
+    "xmldom": "^0.3.0"
+  }
+}

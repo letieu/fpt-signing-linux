@@ -1,0 +1,16 @@
+[Unit]
+Description=FPT CA USB Signing Service (Headless)
+After=network.target pcscd.service
+Wants=pcscd.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/fpt-signing-linux
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=TOKEN_PIN=YOUR_PIN_HERE
+
+[Install]
+WantedBy=default.target

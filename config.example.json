@@ -1,0 +1,11 @@
+{
+  "port": 35317,
+  "pin": "12345678",
+  "pkcs11Path": "/usr/lib/opensc-pkcs11.so",
+  "fallbackPaths": [
+    "/usr/lib/pkcs11/opensc-pkcs11.so",
+    "/usr/lib64/opensc-pkcs11.so",
+    "/usr/local/lib/opensc-pkcs11.so",
+    "/usr/lib/libePass2003.so"
+  ]
+}

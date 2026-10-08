@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test-sign": "node cli-sign.js"
+    "test-sign": "node cli-sign.js",
+    "build-tool": "gcc -O2 -Ibin/include bin/epass2003-tool.c -o bin/epass2003-tool -lopensc"
   },
   "dependencies": {
     "cors": "^2.8.5",

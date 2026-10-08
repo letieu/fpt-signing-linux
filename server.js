@@ -13,6 +13,9 @@ const select = xmlcrypto.xpath;
 const dom = require("xmldom").DOMParser;
 const DOM = new dom();
 const requestIP = require("request-ip");
+const crypto = require("crypto");
+const tokenNative = require("./token-native");
+const { signXmlDocument } = require("./xml-signer");
 
 // Load config
 const configPath = path.join(__dirname, "config.json");
@@ -144,6 +147,18 @@ function resolvePkcs11Module() {
 // PKCS#11 Token Management
 async function initPkcs11() {
     try {
+        if (tokenNative.isAvailable()) {
+            try {
+                CERTS = tokenNative.init(config.pin);
+                if (CERTS && CERTS.length > 0) {
+                    console.log(`[TokenNative] Successfully initialized Feitian ePass2003 with ${CERTS.length} certificate(s)!`);
+                    return true;
+                }
+            } catch (nativeErr) {
+                console.warn("[TokenNative] Native driver warning:", nativeErr.message);
+            }
+        }
+
         if (mod) {
             try { mod.finalize(); mod.close(); } catch (e) {}
             mod = null;
@@ -291,6 +306,10 @@ function findCert(key, val, nowMoment) {
 async function signPdf(serial, nowMoment, pdfBuffer, sha256) {
     const cert = findCert("serial", serial, nowMoment);
     if (!cert) throw new Error(`Certificate with serial ${serial} not found or expired`);
+    if (tokenNative.certs.length > 0 && tokenNative.privateKey) {
+        return tokenNative.signPdf(cert, pdfBuffer, sha256);
+    }
+
 
     return await withUserSession(async (session) => {
         const keys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
@@ -440,41 +459,75 @@ app.post("/pdf", async (req, res) => {
     }
 });
 
-app.post("/xml", async (req, res) => {
+app.post(["/xml", "/xml/:decree"], async (req, res) => {
     try {
         const body = req.body;
-        const mst = body.mst, arr = body.arr, ref = body.ref, signs = [], ids = [];
+        const mst = body.mst, arr = body.arr || [], signs = [], ids = [];
+        console.log(`[SIGN-XML] Received request: decree=${req.params.decree || "standard"}, MST=${mst}, items=${arr.length}`);
 
-        await withUserSession(async (session) => {
-            const keys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
-            if (keys.length === 0) throw new Error("Private key not found");
-            const privateKey = keys.items(0).toType();
+        if (CERTS.length === 0) {
+            await initPkcs11();
+        }
 
+        if (tokenNative.certs.length > 0 && tokenNative.privateKey) {
             for (const obj of arr) {
                 const cert = findCert("mst", mst, moment(obj.idt));
                 if (cert) {
-                    const keyInfo = new myKeyInfo(cert);
                     const id = obj.inc;
-                    const xml = Buffer.from(obj.xml, "base64").toString();
-                    const doc = DOM.parseFromString(xml);
-
-                    let result;
-                    try {
-                        result = signdoc(session, privateKey, doc, id, keyInfo, ref, 1);
-                    } catch (e) {
-                        result = signdoc(session, privateKey, doc, id, keyInfo, ref, 0);
-                    }
-
-                    const signXml = `<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">${result.info}<SignatureValue>${result.val}</SignatureValue><KeyInfo>${x509Data(cert)}</KeyInfo></Signature>`;
-                    const signDoc = DOM.parseFromString(`<dummy>${signXml}</dummy>`);
-                    const refNode = select(doc, "/*")[0];
-                    refNode.appendChild(signDoc.documentElement.firstChild);
-                    signs.push({ inc: id, xml: Buffer.from(doc.toString()).toString("base64") });
+                    const xml = Buffer.from(obj.xml, "base64").toString("utf-8");
+                    const signFn = (canonSignedInfo, isSha256) => {
+                        const signer = crypto.createSign(isSha256 ? "RSA-SHA256" : "RSA-SHA1");
+                        signer.update(canonSignedInfo);
+                        return signer.sign(tokenNative.privateKey).toString("base64");
+                    };
+                    const signedXml = signXmlDocument({
+                        xml,
+                        cert,
+                        signFn,
+                        id,
+                        idt: obj.idt,
+                        ref: obj.ref || body.ref,
+                        signSample: obj.signSample,
+                        sha256: 0
+                    });
+                    signs.push({ inc: id, xml: Buffer.from(signedXml).toString("base64") });
                     ids.push(id);
                 }
             }
-        });
+        } else {
+            await withUserSession(async (session) => {
+                const keys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
+                if (keys.length === 0) throw new Error("Private key not found");
+                const privateKey = keys.items(0).toType();
 
+                for (const obj of arr) {
+                    const cert = findCert("mst", mst, moment(obj.idt));
+                    if (cert) {
+                        const id = obj.inc;
+                        const xml = Buffer.from(obj.xml, "base64").toString("utf-8");
+                        const signFn = (canonSignedInfo, isSha256) => {
+                            const sign = session.createSign(isSha256 ? "SHA256_RSA_PKCS" : "SHA1_RSA_PKCS", privateKey);
+                            sign.update(canonSignedInfo);
+                            return sign.final().toString("base64");
+                        };
+                        const signedXml = signXmlDocument({
+                            xml,
+                            cert,
+                            signFn,
+                            id,
+                            idt: obj.idt,
+                            ref: obj.ref || body.ref,
+                            signSample: obj.signSample,
+                            sha256: 0
+                        });
+                        signs.push({ inc: id, xml: Buffer.from(signedXml).toString("base64") });
+                        ids.push(id);
+                    }
+                }
+            });
+        }
+
+        console.log(`[SIGN-XML] Completed signing: ${signs.length} document(s) signed successfully`);
         res.json({ incs: ids, signs: signs });
     } catch (err) {
         console.error("[SIGN-XML] Error:", err.message);
@@ -489,24 +542,41 @@ app.post("/upload", uploadXML, async (req, res) => {
         const cert = findCert(mst ? "mst" : "serial", mst || body.serial, now);
         if (!cert) throw new Error("Certificate not found");
 
-        const signedXml = await withUserSession(async (session) => {
-            const keys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
-            const privateKey = keys.items(0).toType();
-            const keyInfo = new myKeyInfo(cert);
-            const doc = DOM.parseFromString(buf.toString());
-
-            let result;
-            try {
-                result = signdoc(session, privateKey, doc, 0, keyInfo, ref, 1);
-            } catch (e) {
-                result = signdoc(session, privateKey, doc, 0, keyInfo, ref, 0);
-            }
-            const signXml = `<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">${result.info}<SignatureValue>${result.val}</SignatureValue><KeyInfo>${x509Data(cert)}</KeyInfo></Signature>`;
-            const signDoc = DOM.parseFromString(`<dummy>${signXml}</dummy>`);
-            const refNode = select(doc, "/*")[0];
-            refNode.appendChild(signDoc.documentElement.firstChild);
-            return doc.toString();
-        });
+        let signedXml;
+        if (tokenNative.certs.length > 0 && tokenNative.privateKey) {
+            const signFn = (canonSignedInfo, isSha256) => {
+                const signer = crypto.createSign(isSha256 ? "RSA-SHA256" : "RSA-SHA1");
+                signer.update(canonSignedInfo);
+                return signer.sign(tokenNative.privateKey).toString("base64");
+            };
+            signedXml = signXmlDocument({
+                xml: buf.toString("utf8"),
+                cert,
+                signFn,
+                idt: now,
+                ref,
+                sha256: 0
+            });
+        } else {
+            signedXml = await withUserSession(async (session) => {
+                const keys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
+                if (keys.length === 0) throw new Error("Private key not found");
+                const privateKey = keys.items(0).toType();
+                const signFn = (canonSignedInfo, isSha256) => {
+                    const sign = session.createSign(isSha256 ? "SHA256_RSA_PKCS" : "SHA1_RSA_PKCS", privateKey);
+                    sign.update(canonSignedInfo);
+                    return sign.final().toString("base64");
+                };
+                return signXmlDocument({
+                    xml: buf.toString("utf8"),
+                    cert,
+                    signFn,
+                    idt: now,
+                    ref,
+                    sha256: 0
+                });
+            });
+        }
 
         res.json({ xml: signedXml });
     } catch (err) {

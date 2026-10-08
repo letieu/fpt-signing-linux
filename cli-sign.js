@@ -3,11 +3,14 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const graphene = require("graphene-pk11");
 const forge = require("node-forge");
 const xmlcrypto = require("xml-crypto");
 const dom = require("xmldom").DOMParser;
 const DOM = new dom();
+const tokenNative = require("./token-native");
+const { signXmlDocument } = require("./xml-signer");
 
 // Parse CLI arguments
 const args = process.argv.slice(2);
@@ -82,36 +85,58 @@ console.log(`[+] Target file: ${targetFile}`);
 console.log(`[+] PKCS#11 Module: ${selectedModule}`);
 
 try {
-    const mod = graphene.Module.load(selectedModule);
-    mod.initialize();
+    let certificate, certB64, privateKey, useNative = false;
 
-    const slots = mod.getSlots(true);
-    if (slots.length === 0) {
-        console.error("[-] No token found in any slot. Please insert your USB token.");
-        process.exit(1);
+    if (tokenNative.isAvailable()) {
+        try {
+            const certs = tokenNative.init(config.pin);
+            if (certs && certs.length > 0) {
+                certificate = certs[0].certificate;
+                certB64 = certs[0].c64;
+                useNative = true;
+                console.log(`[+] Token detected: Feitian ePass2003 (Native)`);
+                console.log(`[+] Signer Subject: ${certs[0].cnInSubject}`);
+                console.log(`[+] Signer Serial:  ${certs[0].serial}`);
+            }
+        } catch (e) {
+            console.warn(`[!] Native token init failed: ${e.message}, falling back to PKCS#11...`);
+        }
     }
 
-    const slot = slots.items(0);
-    console.log(`[+] Token detected: ${slot.description}`);
+    let mod = null, session = null;
+    if (!useNative) {
+        mod = graphene.Module.load(selectedModule);
+        mod.initialize();
 
-    const session = slot.open(graphene.SessionFlag.SERIAL_SESSION | graphene.SessionFlag.RW_SESSION);
-    session.login(config.pin);
-    console.log(`[+] PIN login successful!`);
+        const slots = mod.getSlots(true);
+        if (slots.length === 0) {
+            console.error("[-] No token found in any slot. Please insert your USB token.");
+            process.exit(1);
+        }
 
-    const certs = session.find({ class: graphene.ObjectClass.CERTIFICATE });
-    const keys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
+        const slot = slots.items(0);
+        console.log(`[+] Token detected: ${slot.description}`);
 
-    if (certs.length === 0 || keys.length === 0) {
-        console.error("[-] No certificates or private keys found on token.");
-        process.exit(1);
+        session = slot.open(graphene.SessionFlag.SERIAL_SESSION | graphene.SessionFlag.RW_SESSION);
+        session.login(config.pin);
+        console.log(`[+] PIN login successful!`);
+
+        const certs = session.find({ class: graphene.ObjectClass.CERTIFICATE });
+        const keys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
+
+        if (certs.length === 0 || keys.length === 0) {
+            console.error("[-] No certificates or private keys found on token.");
+            process.exit(1);
+        }
+
+        const cert = certs.items(0).toType();
+        certB64 = cert.value.toString("base64");
+        certificate = forge.pki.certificateFromAsn1(forge.asn1.fromDer(cert.value.toString("binary")));
+        privateKey = keys.items(0).toType();
+
+        console.log(`[+] Signer Subject: ${certificate.subject.getField("CN").value}`);
+        console.log(`[+] Signer Serial:  ${certificate.serialNumber}`);
     }
-
-    const cert = certs.items(0).toType();
-    const certificate = forge.pki.certificateFromAsn1(forge.asn1.fromDer(cert.value.toString("binary")));
-    const privateKey = keys.items(0).toType();
-
-    console.log(`[+] Signer Subject: ${certificate.subject.getField("CN").value}`);
-    console.log(`[+] Signer Serial:  ${certificate.serialNumber}`);
 
     const ext = path.extname(targetFile).toLowerCase();
     const fileBytes = fs.readFileSync(targetFile);
@@ -124,55 +149,62 @@ try {
         p7.content = forge.util.createBuffer(fileBytes.toString("binary"));
         p7.addCertificate(certificate);
 
-        const signer = {
-            sign: (md, algo) => {
-                const sign = session.createSign("SHA256_RSA_PKCS", privateKey);
-                return sign.once(fileBytes).toString("binary");
-            }
-        };
+        if (useNative) {
+            const b64 = tokenNative.signPdf({ certificate }, fileBytes, 1);
+            fs.writeFileSync(outFile, Buffer.from(b64, "base64"));
+        } else {
+            const signer = {
+                sign: (md, algo) => {
+                    const sign = session.createSign("SHA256_RSA_PKCS", privateKey);
+                    return sign.once(fileBytes).toString("binary");
+                }
+            };
 
-        p7.addSigner({
-            key: signer,
-            certificate: certificate,
-            digestAlgorithm: forge.pki.oids.sha256
-        });
-        p7.sign({ detached: true });
+            p7.addSigner({
+                key: signer,
+                certificate: certificate,
+                digestAlgorithm: forge.pki.oids.sha256
+            });
+            p7.sign({ detached: true });
 
-        const raw = forge.asn1.toDer(p7.toAsn1()).getBytes();
-        fs.writeFileSync(outFile, Buffer.from(raw, "binary"));
+            const raw = forge.asn1.toDer(p7.toAsn1()).getBytes();
+            fs.writeFileSync(outFile, Buffer.from(raw, "binary"));
+        }
         console.log(`[✔] Signature successfully created at: ${outFile}`);
     } else if (ext === ".xml") {
         if (!outFile) outFile = targetFile.replace(/\.xml$/i, ".signed.xml");
         console.log(`[+] Signing XML document...`);
 
         const xmlString = fileBytes.toString("utf8");
-        const doc = DOM.parseFromString(xmlString);
-        const sig = new xmlcrypto.SignedXml();
-        sig.signatureAlgorithm = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-        sig.addReference("//*[local-name(.)='Object']", null, "http://www.w3.org/2001/04/xmlenc#sha256");
-
-        const pem = cert.value.toString("base64").match(/.{1,64}/g).join("\n");
-        const certPem = `-----BEGIN CERTIFICATE-----\n${pem}\n-----END CERTIFICATE-----`;
-
-        sig.keyInfoProvider = {
-            getKeyInfo: () => `<X509Data><X509Certificate>${cert.value.toString("base64")}</X509Certificate></X509Data>`,
-            getKey: () => certPem
+        const certObj = {
+            c64: certB64,
+            certificate: certificate,
+            subject: certificate ? certificate.subject.attributes.map(a => `${a.shortName || a.name}=${a.value}`).join(", ") : ""
         };
 
-        const signedInfo = sig.createSignedInfo(doc);
-        const signedInfoXml = signedInfo.replace("<SignedInfo>", "<SignedInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">");
-        const dummy = DOM.parseFromString(`<dummy>${signedInfoXml}</dummy>`);
-        const canonXml = sig.getCanonXml(["http://www.w3.org/2001/10/xml-exc-c14n#"], dummy.documentElement.firstChild);
+        let signFn;
+        if (useNative) {
+            signFn = (dataToSign, isSha256) => {
+                const signer = crypto.createSign(isSha256 ? "RSA-SHA256" : "RSA-SHA1");
+                signer.update(dataToSign);
+                return signer.sign(tokenNative.privateKey).toString("base64");
+            };
+        } else {
+            signFn = (dataToSign, isSha256) => {
+                const sign = session.createSign(isSha256 ? "SHA256_RSA_PKCS" : "SHA1_RSA_PKCS", privateKey);
+                sign.update(dataToSign);
+                return sign.final().toString("base64");
+            };
+        }
 
-        const sign = session.createSign("SHA256_RSA_PKCS", privateKey);
-        sign.update(canonXml);
-        const signedVal = sign.final().toString("base64");
+        const signedXml = signXmlDocument({
+            xml: xmlString,
+            cert: certObj,
+            signFn,
+            sha256: 0
+        });
 
-        const signXml = `<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">${signedInfo}<SignatureValue>${signedVal}</SignatureValue><KeyInfo><X509Data><X509Certificate>${cert.value.toString("base64")}</X509Certificate></X509Data></KeyInfo></Signature>`;
-        const signDoc = DOM.parseFromString(`<dummy>${signXml}</dummy>`);
-        doc.documentElement.appendChild(signDoc.documentElement.firstChild);
-
-        fs.writeFileSync(outFile, doc.toString(), "utf8");
+        fs.writeFileSync(outFile, signedXml, "utf8");
         console.log(`[✔] Signed XML successfully written to: ${outFile}`);
     } else {
         console.warn(`[!] Unknown file type '${ext}', signing as binary file to PKCS#7...`);
@@ -194,10 +226,12 @@ try {
         console.log(`[✔] Signature written to: ${outFile}`);
     }
 
-    session.logout();
-    session.close();
-    mod.finalize();
-    mod.close();
+    if (session) {
+        try { session.logout(); session.close(); } catch (e) {}
+    }
+    if (mod) {
+        try { mod.finalize(); mod.close(); } catch (e) {}
+    }
     console.log(`[✔] Done!`);
 } catch (e) {
     console.error(`[-] Signing failed: ${e.message}`);

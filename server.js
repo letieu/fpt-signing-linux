@@ -16,7 +16,7 @@ const requestIP = require("request-ip");
 const crypto = require("crypto");
 const tokenNative = require("./token-native");
 const { signXmlDocument } = require("./xml-signer");
-
+const { signPdfDocument } = require("./pdf-signer");
 // Load config
 const configPath = path.join(__dirname, "config.json");
 let config = {
@@ -46,7 +46,17 @@ if (process.env.TOKEN_PIN) {
 
 const DTF = "YYYY-MM-DD HH:mm:ss";
 const uploadXML = multer({ storage: multer.memoryStorage(), limits: { fileSize: 67108864 } }).single("upload");
+const uploadPDF = multer({ storage: multer.memoryStorage(), limits: { fileSize: 104857600 } }).single("file");
 
+const SIGNED_CACHE = new Map();
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, item] of SIGNED_CACHE.entries()) {
+        if (now - item.created > 2 * 60 * 60 * 1000) {
+            SIGNED_CACHE.delete(id);
+        }
+    }
+}, 15 * 60 * 1000);
 let mod = null;
 let CERTS = [];
 
@@ -372,8 +382,8 @@ app.use(cors());
 app.use(express.json({ limit: "64mb" }));
 app.use(express.urlencoded({ limit: "64mb", extended: true }));
 app.use(requestIP.mw());
-
-// Logging middleware
+app.use(express.static(path.join(__dirname, "public")));
+app.use("/vendor/pdfjs", express.static(path.join(__dirname, "node_modules/pdfjs-dist/build")));
 app.use((req, res, next) => {
     console.log(`[HTTP] ${req.method} ${req.url}`);
     next();
@@ -600,33 +610,217 @@ app.get("/status", (req, res) => {
     });
 });
 
-app.get("/", (req, res) => {
-    res.send(`
-        <html>
-            <head><title>FPT Signing Service (Linux)</title></head>
-            <body style="font-family: sans-serif; padding: 30px;">
-                <h2>🚀 FPT CA USB Signing Service (Linux / Headless)</h2>
-                <p>Status: <strong>Running on port ${config.port}</strong></p>
-                <p>PKCS#11 Library: <code>${resolvePkcs11Module()}</code></p>
-                <p>Certificates Detected: <strong>${CERTS.length}</strong></p>
-                <ul>
-                    ${CERTS.map(c => `<li><strong>${c.cnInSubject}</strong> (MST: ${c.mst}, Serial: ${c.serial}, Valid until: ${c.td})</li>`).join("")}
-                </ul>
-                <hr/>
-                <p><small>Endpoints: <code>/certs</code>, <code>/pdf</code>, <code>/xml</code>, <code>/upload</code>, <code>/reset</code>, <code>/status</code></small></p>
-            </body>
-        </html>
-    `);
+app.get(["/", "/ui"], (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
+app.get("/api/token-info", async (req, res) => {
+    try {
+        if (CERTS.length === 0) {
+            await initPkcs11();
+        }
+        const hasNative = tokenNative.certs.length > 0 && tokenNative.privateKey;
+        const mode = hasNative ? "native" : (CERTS.length > 0 ? "pkcs11" : "none");
+        res.json({
+            connected: CERTS.length > 0,
+            mode: mode,
+            reader: mode === "native" ? "Feitian ePass2003 (Native CCID)" : resolvePkcs11Module(),
+            hasDefaultPin: !!config.pin,
+            certs: CERTS.map(c => ({
+                cn: c.cnInSubject,
+                mst: c.mst,
+                serial: c.serial,
+                validFrom: c.fd,
+                validTo: c.td,
+                issuer: c.issuer
+            }))
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post("/api/token-refresh", async (req, res) => {
+    try {
+        if (req.body && req.body.pin) {
+            config.pin = req.body.pin;
+        }
+        await initPkcs11();
+        const hasNative = tokenNative.certs.length > 0 && tokenNative.privateKey;
+        const mode = hasNative ? "native" : (CERTS.length > 0 ? "pkcs11" : "none");
+        res.json({
+            success: true,
+            connected: CERTS.length > 0,
+            mode: mode,
+            reader: mode === "native" ? "Feitian ePass2003 (Native CCID)" : resolvePkcs11Module(),
+            certs: CERTS.map(c => ({
+                cn: c.cnInSubject,
+                mst: c.mst,
+                serial: c.serial,
+                validFrom: c.fd,
+                validTo: c.td,
+                issuer: c.issuer
+            }))
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post("/api/sign-pdf", uploadPDF, async (req, res) => {
+    try {
+        if (!req.file || !req.file.buffer) {
+            return res.status(400).json({ success: false, error: "No PDF file uploaded" });
+        }
+
+        const customPin = req.body.pin;
+        if (customPin && customPin !== config.pin) {
+            config.pin = customPin;
+            await initPkcs11();
+        }
+
+        if (CERTS.length === 0) {
+            await initPkcs11();
+        }
+
+        if (CERTS.length === 0) {
+            return res.status(400).json({ success: false, error: "No USB Token or certificate detected. Please connect your USB Token." });
+        }
+
+        const serial = req.body.serial;
+        const signatureType = req.body.signatureType || "embedded";
+        const visible = req.body.visible !== "false";
+        const position = req.body.position || "bottom-right";
+        const page = req.body.page || "last";
+        const reason = req.body.reason || "Xác nhận văn bản điện tử";
+
+        let coords = null;
+        if (req.body.customX !== undefined && req.body.customY !== undefined && req.body.customX !== "" && req.body.customY !== "") {
+            coords = {
+                x: parseFloat(req.body.customX),
+                y: parseFloat(req.body.customY),
+                width: req.body.customWidth ? parseFloat(req.body.customWidth) : 250,
+                height: req.body.customHeight ? parseFloat(req.body.customHeight) : 62
+            };
+        }
+        let certEntry = CERTS[0];
+        if (serial) {
+            const found = CERTS.find(c => c.serial.toLowerCase() === serial.toLowerCase());
+            if (found) certEntry = found;
+        }
+
+        let signResult;
+        if (tokenNative.certs.length > 0 && tokenNative.privateKey) {
+            const signFn = (dataBuf) => {
+                const signer = crypto.createSign("RSA-SHA256");
+                signer.update(dataBuf);
+                return signer.sign(tokenNative.privateKey).toString("binary");
+            };
+            signResult = await signPdfDocument({
+                pdfBuffer: req.file.buffer,
+                certEntry: tokenNative.certs[0] || certEntry,
+                signFn,
+                signatureType,
+                visible,
+                position,
+                coords,
+                page,
+                reason
+            });
+        } else {
+            await withUserSession(async (session) => {
+                const keys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
+                if (keys.length === 0) throw new Error("Private key not found on token");
+                const privateKey = keys.items(0).toType();
+                const signFn = (dataBuf) => {
+                    const sign = session.createSign("SHA256_RSA_PKCS", privateKey);
+                    return sign.once(dataBuf).toString("binary");
+                };
+                signResult = await signPdfDocument({
+                    pdfBuffer: req.file.buffer,
+                    certEntry,
+                    signFn,
+                    signatureType,
+                    visible,
+                    position,
+                    coords,
+                    page,
+                    reason
+                });
+            });
+        }
+
+        const id = crypto.randomBytes(16).toString("hex");
+        const originalName = req.file.originalname || "document.pdf";
+        const baseName = originalName.replace(/\.pdf$/i, "");
+        const signedFilename = `${baseName}_signed.pdf`;
+        const p7sFilename = `${baseName}.pdf.p7s`;
+
+        SIGNED_CACHE.set(id, {
+            created: Date.now(),
+            filename: signedFilename,
+            p7sFilename: p7sFilename,
+            signedPdfBuffer: signResult.signedPdfBuffer,
+            detachedP7sBuffer: signResult.detachedP7sBuffer
+        });
+
+        res.json({
+            success: true,
+            id: id,
+            filename: signedFilename,
+            p7sFilename: p7sFilename,
+            fileSize: signResult.signedPdfBuffer ? signResult.signedPdfBuffer.length : (signResult.detachedP7sBuffer ? signResult.detachedP7sBuffer.length : 0),
+            hasPdf: !!signResult.signedPdfBuffer,
+            hasP7s: !!signResult.detachedP7sBuffer,
+            signer: signResult.certInfo.cn,
+            serial: signResult.certInfo.serial,
+            mst: signResult.certInfo.mst,
+            signedAt: moment().format("YYYY-MM-DD HH:mm:ss")
+        });
+    } catch (err) {
+        console.error("[API-SIGN-PDF] Error:", err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get("/api/download/:id", (req, res) => {
+    const item = SIGNED_CACHE.get(req.params.id);
+    if (!item) {
+        return res.status(404).send("File not found or expired.");
+    }
+    const type = req.query.type;
+    if (type === "p7s") {
+        if (!item.detachedP7sBuffer) return res.status(404).send("P7S signature not found.");
+        res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(item.p7sFilename)}"`);
+        res.setHeader("Content-Type", "application/pkcs7-signature");
+        return res.send(item.detachedP7sBuffer);
+    }
+    if (!item.signedPdfBuffer) {
+        return res.status(404).send("Signed PDF not found.");
+    }
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(item.filename)}"`);
+    res.setHeader("Content-Type", "application/pdf");
+    res.send(item.signedPdfBuffer);
+});
 // Start Server
 async function start() {
     await initPkcs11();
-    app.listen(config.port, "127.0.0.1", () => {
+    const server = app.listen(config.port, "127.0.0.1", () => {
         console.log(`\n======================================================`);
         console.log(`🚀 FPT USB Signing Service is listening on 127.0.0.1:${config.port}`);
         console.log(`📡 Ready to receive signing requests from web browser portals!`);
+        console.log(`👉 Web UI: http://127.0.0.1:${config.port}`);
         console.log(`======================================================\n`);
+    });
+
+    server.on("error", (err) => {
+        if (err.code === "EADDRINUSE") {
+            console.error(`\n[-] Port ${config.port} is already in use by another process.`);
+            console.error(`[-] To free the port, run: fuser -k ${config.port}/tcp`);
+        } else {
+            console.error("[-] Server error:", err.message);
+        }
+        process.exit(1);
     });
 }
 

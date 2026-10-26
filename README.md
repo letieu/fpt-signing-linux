@@ -6,11 +6,11 @@ Phiên bản độc lập (Headless) trích xuất từ **FPT USB Signing Tool**
 
 ## 🎯 Tính năng
 
-1. **Web Browser Signing Daemon**: Chạy Express server trên `http://127.0.0.1:35317` hỗ trợ đầy đủ các cổng thuế / hóa đơn điện tử FPT e-Invoice (Chrome, Firefox, Brave trên Linux).
-2. **CLI Direct Signing**: Ký trực tiếp file PDF / XML từ dòng lệnh (`node cli-sign.js document.pdf`).
-3. **Auto PIN login**: Tự động xác thực mã PIN qua PKCS#11 mà không cần bấm thủ công.
-4. **Hỗ trợ phần cứng gốc**: Token Feitian ePass2003 được hỗ trợ gốc (native CCID) thông qua OpenSC driver `epass2003`.
-
+1. **Giao Diện Web Ký PDF (Web UI)**: Truy cập trực tiếp `http://127.0.0.1:35317` để kéo-thả ký file PDF, hỗ trợ nhúng chữ ký số chuẩn PAdES (hiển thị tích xanh trong Adobe Acrobat) và dấu ký số trực quan (Visual Stamp).
+2. **Web Browser Signing Daemon**: Chạy Express server trên `http://127.0.0.1:35317` hỗ trợ đầy đủ các cổng thuế / hóa đơn điện tử FPT e-Invoice (Chrome, Firefox, Brave trên Linux).
+3. **CLI Direct Signing**: Ký trực tiếp file PDF / XML từ dòng lệnh (`node cli-sign.js document.pdf`).
+4. **Auto PIN login**: Tự động xác thực mã PIN qua PKCS#11 mà không cần bấm thủ công.
+5. **Hỗ trợ phần cứng gốc**: Token Feitian ePass2003 được hỗ trợ gốc (native CCID) thông qua OpenSC driver `epass2003`.
 ---
 
 ## 📦 1. Cài đặt các gói trên Arch Linux

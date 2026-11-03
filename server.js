@@ -22,12 +22,30 @@ const configPath = path.join(__dirname, "config.json");
 let config = {
     port: 35317,
     pin: process.env.TOKEN_PIN || "",
-    pkcs11Path: "/usr/lib/opensc-pkcs11.so",
+    pkcs11Path: process.env.PKCS11_MODULE_PATH || (process.platform === "darwin" ? "/opt/homebrew/lib/opensc-pkcs11.so" : "/usr/lib/opensc-pkcs11.so"),
     fallbackPaths: [
+        "/opt/homebrew/lib/opensc-pkcs11.so",
+        "/opt/homebrew/lib/onepin-opensc-pkcs11.so",
+        "/usr/local/lib/opensc-pkcs11.so",
+        "/usr/local/lib/onepin-opensc-pkcs11.so",
+        "/Library/OpenSC/lib/opensc-pkcs11.so",
+        "/Library/OpenSC/lib/onepin-opensc-pkcs11.so",
+        "/usr/lib/opensc-pkcs11.so",
+        "/usr/lib/onepin-opensc-pkcs11.so",
+        "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so",
+        "/usr/lib/x86_64-linux-gnu/onepin-opensc-pkcs11.so",
+        "/usr/lib/aarch64-linux-gnu/opensc-pkcs11.so",
+        "/usr/lib/aarch64-linux-gnu/onepin-opensc-pkcs11.so",
         "/usr/lib/pkcs11/opensc-pkcs11.so",
         "/usr/lib64/opensc-pkcs11.so",
-        "/usr/local/lib/opensc-pkcs11.so",
-        "/usr/lib/libePass2003.so"
+        "/usr/lib64/pkcs11/opensc-pkcs11.so",
+        "/usr/lib/libePass2003.so",
+        "/usr/lib64/libePass2003.so",
+        "C:/Windows/System32/opensc-pkcs11.dll",
+        "C:/Program Files/OpenSC Project/OpenSC/pkcs11/opensc-pkcs11.dll",
+        "C:/Program Files (x86)/OpenSC Project/OpenSC/pkcs11/opensc-pkcs11.dll",
+        "C:/Windows/SysWOW64/fptca_v4.dll",
+        "C:/Windows/System32/fptca_v4.dll"
     ]
 };
 
@@ -151,7 +169,7 @@ function resolvePkcs11Module() {
             return p;
         }
     }
-    return config.pkcs11Path;
+    return null;
 }
 
 // PKCS#11 Token Management
@@ -175,10 +193,12 @@ async function initPkcs11() {
         }
 
         const modulePath = resolvePkcs11Module();
-        console.log(`[PKCS#11] Loading module: ${modulePath}`);
-        if (!fs.existsSync(modulePath)) {
-            console.error(`[PKCS#11] Module not found at ${modulePath}. Make sure 'opensc' is installed: sudo pacman -S opensc`);
+        if (!modulePath) {
+            console.warn("[PKCS#11] OpenSC PKCS#11 module not found. Make sure 'opensc' is installed (macOS: brew install opensc, Linux: sudo apt/pacman/dnf install opensc)");
+            CERTS = [];
+            return false;
         }
+        console.log(`[PKCS#11] Loading module: ${modulePath}`);
 
         mod = graphene.Module.load(modulePath);
         mod.initialize();
@@ -316,8 +336,13 @@ function findCert(key, val, nowMoment) {
 async function signPdf(serial, nowMoment, pdfBuffer, sha256) {
     const cert = findCert("serial", serial, nowMoment);
     if (!cert) throw new Error(`Certificate with serial ${serial} not found or expired`);
-    if (tokenNative.certs.length > 0 && tokenNative.privateKey) {
-        return tokenNative.signPdf(cert, pdfBuffer, sha256);
+    if (tokenNative.certs.length > 0) {
+        if (!tokenNative.privateKey && config.pin) {
+            try { tokenNative.loadKey(config.pin); } catch (e) {}
+        }
+        if (tokenNative.privateKey) {
+            return tokenNative.signPdf(cert, pdfBuffer, sha256);
+        }
     }
 
 
@@ -479,6 +504,16 @@ app.post(["/xml", "/xml/:decree"], async (req, res) => {
             await initPkcs11();
         }
 
+        if (tokenNative.certs.length > 0) {
+            const pinToUse = body.pin || config.pin;
+            if (!tokenNative.privateKey && pinToUse) {
+                try {
+                    tokenNative.loadKey(pinToUse);
+                } catch (e) {
+                    throw new Error(`Xác thực PIN thất bại: ${e.message}`);
+                }
+            }
+        }
         if (tokenNative.certs.length > 0 && tokenNative.privateKey) {
             for (const obj of arr) {
                 const cert = findCert("mst", mst, moment(obj.idt));
@@ -553,6 +588,16 @@ app.post("/upload", uploadXML, async (req, res) => {
         if (!cert) throw new Error("Certificate not found");
 
         let signedXml;
+        if (tokenNative.certs.length > 0) {
+            const pinToUse = body.pin || config.pin;
+            if (!tokenNative.privateKey && pinToUse) {
+                try {
+                    tokenNative.loadKey(pinToUse);
+                } catch (e) {
+                    throw new Error(`Xác thực PIN thất bại: ${e.message}`);
+                }
+            }
+        }
         if (tokenNative.certs.length > 0 && tokenNative.privateKey) {
             const signFn = (canonSignedInfo, isSha256) => {
                 const signer = crypto.createSign(isSha256 ? "RSA-SHA256" : "RSA-SHA1");
@@ -619,12 +664,12 @@ app.get("/api/token-info", async (req, res) => {
         if (CERTS.length === 0) {
             await initPkcs11();
         }
-        const hasNative = tokenNative.certs.length > 0 && tokenNative.privateKey;
+        const hasNative = tokenNative.certs.length > 0;
         const mode = hasNative ? "native" : (CERTS.length > 0 ? "pkcs11" : "none");
         res.json({
             connected: CERTS.length > 0,
             mode: mode,
-            reader: mode === "native" ? "Feitian ePass2003 (Native CCID)" : resolvePkcs11Module(),
+            reader: mode === "native" ? "Feitian ePass2003 (Native CCID)" : (resolvePkcs11Module() || "None"),
             hasDefaultPin: !!config.pin,
             certs: CERTS.map(c => ({
                 cn: c.cnInSubject,
@@ -646,13 +691,13 @@ app.post("/api/token-refresh", async (req, res) => {
             config.pin = req.body.pin;
         }
         await initPkcs11();
-        const hasNative = tokenNative.certs.length > 0 && tokenNative.privateKey;
+        const hasNative = tokenNative.certs.length > 0;
         const mode = hasNative ? "native" : (CERTS.length > 0 ? "pkcs11" : "none");
         res.json({
             success: true,
             connected: CERTS.length > 0,
             mode: mode,
-            reader: mode === "native" ? "Feitian ePass2003 (Native CCID)" : resolvePkcs11Module(),
+            reader: mode === "native" ? "Feitian ePass2003 (Native CCID)" : (resolvePkcs11Module() || "None"),
             certs: CERTS.map(c => ({
                 cn: c.cnInSubject,
                 mst: c.mst,
@@ -676,11 +721,34 @@ app.post("/api/sign-pdf", uploadPDF, async (req, res) => {
         const customPin = req.body.pin;
         if (customPin && customPin !== config.pin) {
             config.pin = customPin;
-            await initPkcs11();
+            if (tokenNative.isAvailable()) {
+                try {
+                    tokenNative.loadKey(customPin);
+                } catch (e) {
+                    console.warn("[API-SIGN-PDF] Failed to load key with custom PIN:", e.message);
+                }
+            }
         }
 
         if (CERTS.length === 0) {
             await initPkcs11();
+        }
+
+        if (CERTS.length === 0) {
+            return res.status(400).json({ success: false, error: "No USB Token or certificate detected. Please connect your USB Token." });
+        }
+
+        if (tokenNative.certs.length > 0 && !tokenNative.privateKey) {
+            const pinToUse = customPin || config.pin;
+            if (pinToUse) {
+                try {
+                    tokenNative.loadKey(pinToUse);
+                } catch (e) {
+                    return res.status(400).json({ success: false, error: `Xác thực mã PIN thất bại: ${e.message}` });
+                }
+            } else {
+                return res.status(400).json({ success: false, error: "Vui lòng nhập mã PIN của USB Token để thực hiện ký số." });
+            }
         }
 
         if (CERTS.length === 0) {

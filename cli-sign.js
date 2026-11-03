@@ -40,7 +40,7 @@ if (!fs.existsSync(targetFile)) {
 // Load config
 let config = {
     pin: process.env.TOKEN_PIN || "",
-    pkcs11Path: "/usr/lib/opensc-pkcs11.so"
+    pkcs11Path: process.env.PKCS11_MODULE_PATH || (process.platform === "darwin" ? "/opt/homebrew/lib/opensc-pkcs11.so" : "/usr/lib/opensc-pkcs11.so")
 };
 
 const configPath = path.join(__dirname, "config.json");
@@ -62,9 +62,20 @@ let outFile = outIdx !== -1 && args[outIdx + 1] ? args[outIdx + 1] : null;
 // Determine module path
 const candidates = [
     config.pkcs11Path,
+    "/opt/homebrew/lib/opensc-pkcs11.so",
+    "/opt/homebrew/lib/onepin-opensc-pkcs11.so",
+    "/usr/local/lib/opensc-pkcs11.so",
+    "/usr/local/lib/onepin-opensc-pkcs11.so",
+    "/Library/OpenSC/lib/opensc-pkcs11.so",
     "/usr/lib/opensc-pkcs11.so",
+    "/usr/lib/onepin-opensc-pkcs11.so",
+    "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so",
+    "/usr/lib/aarch64-linux-gnu/opensc-pkcs11.so",
     "/usr/lib/pkcs11/opensc-pkcs11.so",
     "/usr/lib64/opensc-pkcs11.so",
+    "/usr/lib/libePass2003.so",
+    "C:/Windows/System32/opensc-pkcs11.dll",
+    "C:/Program Files/OpenSC Project/OpenSC/pkcs11/opensc-pkcs11.dll",
     "C:/Windows/SysWOW64/fptca_v4.dll",
     "C:/Windows/System32/fptca_v4.dll"
 ];
@@ -93,6 +104,13 @@ try {
             if (certs && certs.length > 0) {
                 certificate = certs[0].certificate;
                 certB64 = certs[0].c64;
+                if (!tokenNative.privateKey && config.pin) {
+                    try { tokenNative.loadKey(config.pin); } catch (e) {}
+                }
+                if (!tokenNative.privateKey) {
+                    console.error("[-] Token PIN required for signing. Please specify --pin <pin> or set TOKEN_PIN in config.json / environment.");
+                    process.exit(1);
+                }
                 useNative = true;
                 console.log(`[+] Token detected: Feitian ePass2003 (Native)`);
                 console.log(`[+] Signer Subject: ${certs[0].cnInSubject}`);
@@ -105,6 +123,10 @@ try {
 
     let mod = null, session = null;
     if (!useNative) {
+        if (!selectedModule || !fs.existsSync(selectedModule)) {
+            console.error("[-] PKCS#11 module not found. Please install OpenSC or pass --module <path>.");
+            process.exit(1);
+        }
         mod = graphene.Module.load(selectedModule);
         mod.initialize();
 

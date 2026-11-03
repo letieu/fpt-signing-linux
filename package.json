@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "test-sign": "node cli-sign.js",
-    "build-tool": "gcc -O2 -Ibin/include bin/epass2003-tool.c -o bin/epass2003-tool -lopensc"
+    "build-tool": "node bin/build.js"
   },
   "dependencies": {
     "@pdf-lib/fontkit": "^1.1.1",

@@ -12,6 +12,31 @@ const DOM = new dom();
 const { signXmlDocument } = require("./xml-signer");
 const DTF = "YYYY-MM-DD HH:mm:ss";
 const TOOL_PATH = path.join(__dirname, "bin", "epass2003-tool");
+let binaryChecked = false;
+
+function ensureBinary() {
+    if (binaryChecked && fs.existsSync(TOOL_PATH)) return true;
+    if (fs.existsSync(TOOL_PATH)) {
+        try {
+            const check = cp.spawnSync(TOOL_PATH, [], { stdio: "pipe" });
+            if (!check.error) {
+                binaryChecked = true;
+                return true;
+            }
+            if (check.error.code === "ENOEXEC" || check.error.code === "EACCES") {
+                console.warn(`[TokenNative] Binary at ${TOOL_PATH} is incompatible with current OS/arch (${check.error.code}). Rebuilding...`);
+            }
+        } catch (e) {}
+    }
+    try {
+        const { buildTool } = require("./bin/build");
+        const ok = buildTool();
+        if (ok) binaryChecked = true;
+        return ok;
+    } catch (e) {
+        return false;
+    }
+}
 
 function encodeDerInteger(b) {
     let start = 0;
@@ -159,12 +184,37 @@ class TokenNative {
     }
 
     isAvailable() {
-        return fs.existsSync(TOOL_PATH);
+        return ensureBinary();
+    }
+
+    loadKey(pin) {
+        if (!pin || pin.toString().trim().length === 0) {
+            throw new Error("PIN required");
+        }
+        if (!ensureBinary()) {
+            throw new Error(`Tool not found or could not be built at ${TOOL_PATH}`);
+        }
+        let keyRaw;
+        try {
+            keyRaw = cp.execFileSync(TOOL_PATH, ["read-key", pin.toString().trim()]);
+        } catch (e) {
+            const errMsg = e.stderr ? e.stderr.toString().trim() : e.message;
+            throw new Error("Failed to authenticate/read private key: " + errMsg);
+        }
+
+        const { cryptoKey, forgeKey } = parsePrivateKey24A0(keyRaw);
+        this.privateKey = cryptoKey;
+        this.forgePrivateKey = forgeKey;
+        if (this.certs && this.certs.length > 0) {
+            this.certs[0].privateKey = cryptoKey;
+            this.certs[0].forgePrivateKey = forgeKey;
+        }
+        return { cryptoKey, forgeKey };
     }
 
     init(pin) {
-        if (!fs.existsSync(TOOL_PATH)) {
-            throw new Error(`Tool not found at ${TOOL_PATH}`);
+        if (!ensureBinary()) {
+            throw new Error(`Tool not found or could not be built at ${TOOL_PATH}`);
         }
 
         console.log(`[TokenNative] Accessing Feitian ePass2003 via native driver...`);
@@ -174,26 +224,13 @@ class TokenNative {
         try {
             certDer = cp.execFileSync(TOOL_PATH, ["read-cert"]);
         } catch (e) {
-            throw new Error("Failed to read certificate from token: " + (e.stderr ? e.stderr.toString() : e.message));
+            const errMsg = e.stderr ? e.stderr.toString().trim() : e.message;
+            throw new Error("Failed to read certificate from token: " + errMsg);
         }
 
         if (!certDer || certDer.length === 0) {
             throw new Error("Empty certificate read from token");
         }
-
-        // 2. Read Key with PIN verification
-        let keyRaw;
-        try {
-            keyRaw = cp.execFileSync(TOOL_PATH, ["read-key", pin || ""]);
-        } catch (e) {
-            const errMsg = e.stderr ? e.stderr.toString() : e.message;
-            throw new Error("Failed to authenticate/read private key: " + errMsg);
-        }
-
-        const { cryptoKey, forgeKey } = parsePrivateKey24A0(keyRaw);
-        this.privateKey = cryptoKey;
-        this.forgePrivateKey = forgeKey;
-
         // Parse certificate
         const forgeCert = forge.pki.certificateFromAsn1(forge.asn1.fromDer(certDer.toString("binary")));
         const validity = forgeCert.validity;
@@ -238,18 +275,31 @@ class TokenNative {
             c64: certDer.toString("base64"),
             info: `#${mst || ""}#${scn}#${fd.format("YYYY-MM-DD")}..${td.format("YYYY-MM-DD")}`,
             certificate: forgeCert,
-            privateKey: cryptoKey,
-            forgePrivateKey: forgeKey
+            privateKey: null,
+            forgePrivateKey: null
         };
 
         this.certs = [entry];
-        console.log(`[TokenNative] Loaded Cert: ${scn} (Serial: ${serial}, MST: ${mst})`);
+        console.log(`[TokenNative] Loaded Cert: ${scn} (Serial: ${serial}, MST: ${mst || "N/A"})`);
         console.log(`[TokenNative] Valid: ${entry.fd} -> ${entry.td}`);
+
+        // 2. Read Key with PIN verification if PIN is available
+        if (pin && pin.toString().trim().length > 0) {
+            try {
+                this.loadKey(pin.toString().trim());
+                console.log(`[TokenNative] Private key unlocked successfully.`);
+            } catch (keyErr) {
+                console.warn(`[TokenNative] Key unlock warning: ${keyErr.message}`);
+            }
+        } else {
+            console.log(`[TokenNative] Token PIN not configured yet; private key will be unlocked when PIN is provided.`);
+        }
+
         return this.certs;
     }
 
     signXml(doc, id, keyInfo, ref, sha256) {
-        if (!this.privateKey) throw new Error("Private key not initialized");
+        if (!this.privateKey) throw new Error("Private key not initialized. Please provide token PIN.");
 
         const sig = new xmlcrypto.SignedXml();
         sig.id = id;
@@ -278,7 +328,7 @@ class TokenNative {
     }
 
     signXmlDocument(params) {
-        if (!this.privateKey) throw new Error("Private key not initialized");
+        if (!this.privateKey) throw new Error("Private key not initialized. Please provide token PIN.");
         const cert = params.cert || this.certs[0];
         const signFn = (canonSignedInfo, isSha256) => {
             const signer = crypto.createSign(isSha256 ? "RSA-SHA256" : "RSA-SHA1");
@@ -293,7 +343,7 @@ class TokenNative {
     }
 
     signPdf(cert, pdfBuf, sha256) {
-        if (!this.privateKey) throw new Error("Private key not initialized");
+        if (!this.privateKey) throw new Error("Private key not initialized. Please provide token PIN.");
 
         const algorithm = sha256 === 1 ? "RSA-SHA256" : "RSA-SHA1";
         const digestAlgorithm = sha256 === 1 ? forge.pki.oids.sha256 : forge.pki.oids.sha1;

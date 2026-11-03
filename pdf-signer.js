@@ -16,6 +16,9 @@ try {
 // Find system font for Vietnamese unicode text if available
 function findSystemFont() {
     const candidates = [
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/usr/share/fonts/TTF/Roboto-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
